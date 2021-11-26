@@ -42,7 +42,7 @@ describe("Multisig", function () {
       const owner = await multisig.signers(i);
       owners.push(owner);
     }
-    const reqSignatures = await multisig.numConfirmationsRequired();
+    const reqSignatures = await multisig.numApprovalsRequired();
     expect(Number(reqSignatures)).to.eq(1);
     expect(await multisig.signers(0)).to.eq(signers[0].address);
     expect(await multisig.signers(1)).to.eq(signers[1].address);
@@ -56,7 +56,7 @@ describe("Multisig", function () {
       signers[1].address
     );
 
-    await multisig.approveProposal(0);
+    // await multisig.approveProposal(0);
     await multisig.executeRemoteProposal(0);
 
     const currentOwner = await mocktoken.owner(); // should be signer[1]
@@ -97,7 +97,7 @@ describe("Multisig", function () {
       mocktoken.address,
       fakeBUSDToken.address
     );
-    await multisig.approveProposal(0);
+    // await multisig.approveProposal(0);
     await multisig.executeRemoteProposal(0);
 
     const amount = ethers.utils.parseUnits("10000", 6);
@@ -110,7 +110,7 @@ describe("Multisig", function () {
 
     const prevBal = await fakeBUSDToken.balanceOf(signers[3].address);
 
-    await multisig.approveProposal(1);
+    // await multisig.approveProposal(1);
     await multisig.executeMultisigProposal(1);
 
     const newBal = await fakeBUSDToken.balanceOf(signers[3].address);
@@ -129,8 +129,9 @@ describe("Multisig", function () {
     const proposalPrev = await multisig.getProposal(0);
     await multisig.connect(signers[1]).rejectProposal(0);
     const proposalNow = await multisig.getProposal(0);
-    expect(proposalPrev.state).to.eq(0);
-    expect(proposalNow.state).to.eq(2);
+
+    expect(proposalPrev._state).to.eq(0);
+    expect(proposalNow._state).to.eq(2);
   });
 
   it("should throw error if approve -> reject instead of approve -> revoke -> reject", async () => {
@@ -140,7 +141,7 @@ describe("Multisig", function () {
       fakeBUSDToken.address
     );
 
-    await multisig.connect(signers[1]).approveProposal(0);
+    // await multisig.connect(signers[1]).approveProposal(0);
     try {
       await multisig.connect(signers[1]).rejectProposal(0);
     } catch (e: any) {
@@ -159,7 +160,7 @@ describe("Multisig", function () {
     const fundedBal = await ethers.provider.getBalance(multisig.address);
 
     await multisig.requestTransferETH(signers[1].address, amount);
-    await multisig.approveProposal(0);
+    // await multisig.approveProposal(0);
     await multisig.executeMultisigProposal(0);
     const emptyBal = await ethers.provider.getBalance(multisig.address);
     const newBal = await ethers.provider.getBalance(signers[1].address);
@@ -178,7 +179,7 @@ describe("Multisig", function () {
 
     const previously = await multisig.signers(0);
 
-    await multisig.approveProposal(0);
+    // await multisig.approveProposal(0);
     await multisig.executeMultisigProposal(0);
 
     const currently = await multisig.signers(0);
@@ -198,5 +199,35 @@ describe("Multisig", function () {
     } catch (e: any) {
       expect(e.message).to.include("Incorrect Signer Index");
     }
+  });
+
+  it("should add a new signer", async () => {
+    const prevOwners = [];
+    for (let i = 0; i < multisigSigners.length; i++) {
+      const owner = await multisig.signers(i);
+      prevOwners.push(owner);
+    }
+    await multisig.requestAddNewSigner(signers[2].address);
+    await multisig.executeMultisigProposal(0);
+
+    const newOwners = [];
+    for (let i = 0; i < 3; i++) {
+      const owner = await multisig.signers(i);
+      newOwners.push(owner);
+    }
+
+    expect(prevOwners).to.not.include(signers[2].address);
+    expect(newOwners).include(signers[2].address);
+  });
+
+  it("should update number of required approvals", async () => {
+    const prev = await multisig.numApprovalsRequired();
+
+    await multisig.requestUpdateReqApprovals(2);
+    await multisig.executeMultisigProposal(0);
+    const updated = await multisig.numApprovalsRequired();
+
+    expect(Number(prev)).eq(1);
+    expect(Number(updated)).eq(2);
   });
 });

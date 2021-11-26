@@ -1,12 +1,52 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "./Mock.sol";
+interface IBEP20 {
+  function transfer(address recipient, uint256 amount)
+    external
+    returns (bool);
+}
+
+
+library SafeBEP20 {
+    using Address for address;
+
+    function safeTransfer(IBEP20 token, address to, uint256 value) internal {
+        callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+    function callOptionalReturn(IBEP20 token, bytes memory data) private {
+        require(address(token).isContract(), "SafeBEP20: call to non-contract");
+
+        (bool success, bytes memory returndata) = address(token).call(data);
+        require(success, "SafeBEP20: low-level call failed");
+
+        if (returndata.length > 0) {
+            require(abi.decode(returndata, (bool)), "SafeBEP20: BEP20 operation did not succeed");
+        }
+    }
+}
+
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+  function isContract(address account) internal view returns (bool) {
+    // According to EIP-1052, 0x0 is the value returned for not-yet created accounts
+    // and 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470 is returned
+    // for accounts without code, i.e. `keccak256('')`
+    bytes32 codehash;
+    bytes32 accountHash = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470;
+    // solhint-disable-next-line no-inline-assembly
+    assembly { codehash := extcodehash(account) }
+    return (codehash != accountHash && codehash != 0x0);
+  }
+}
 
 contract Multisig {
     using SafeBEP20 for IBEP20;
 
-    event ProposalCreated(
+    event ProposalCreated (
         address indexed requestor,
         uint indexed proposalIndex,
         bytes indexed data
@@ -15,23 +55,25 @@ contract Multisig {
     event FundTransferred(address indexed receiver, uint256 indexed amount);
     event ApproveProposal(address indexed owner, uint256 indexed txIndex);
     event ExecuteProposal(address indexed owner, uint256 indexed txIndex);
-    event RevokeConfirmation(address indexed owner, uint256 indexed txIndex);
+    event RevokeApproval(address indexed owner, uint256 indexed txIndex);
 
-    enum ProposalType{ 
+    enum ProposalType { 
         TRANSFER_TARGET_OWNERSHIP, 
         WITHDRAW_TOKEN_FROM_TARGET, 
         WITHDRAW_ETH_FROM_TARGET, 
         WITHDRAW_TOKENS_OF_TARGET, 
         TRANSFER_ETH_FROM_MULTISIG, 
         TRANSFER_TOKEN_FROM_MULTISIG, 
-        REPLACE_MULTISIG_SIGNER 
+        REPLACE_MULTISIG_SIGNER,
+        ADD_NEW_SIGNER,
+        UPDATE_REQ_APPROVALS 
     }
 
     enum ProposalState{ PENDING, COMPLETED, REJECTED }
 
     address[] public signers;
     mapping(address => bool) public isSigner;
-    uint256 public numConfirmationsRequired;
+    uint256 public numApprovalsRequired;
 
     struct Proposal {
         address targetContract;
@@ -41,12 +83,12 @@ contract Multisig {
         uint256 amount;
         ProposalType proposalType;
         ProposalState state;
-        uint256 numConfirmations;
+        uint256 numApprovals;
         uint256 numRejections;
     }
 
     // mapping from tx index => owner => bool
-    mapping(uint256 => mapping(address => bool)) public isConfirmed;
+    mapping(uint256 => mapping(address => bool)) public isApproved;
     mapping(uint256 => mapping(address => bool)) public isRejected;
 
     Proposal[] public proposals;
@@ -62,12 +104,12 @@ contract Multisig {
     }
 
 
-    constructor(address[] memory _signers, uint256 _numConfirmationsRequired) {
+    constructor(address[] memory _signers, uint256 _numApprovalsRequired) {
         require(_signers.length > 0, "Signers Required");
         require(
-            _numConfirmationsRequired > 0 &&
-                _numConfirmationsRequired <= _signers.length,
-            "Too Few Confirmations Required"
+            _numApprovalsRequired > 0 &&
+                _numApprovalsRequired <= _signers.length,
+            "Approvals Required Too Few"
         );
 
         for (uint256 i = 0; i < _signers.length; i++) {
@@ -80,7 +122,7 @@ contract Multisig {
             signers.push(signer);
         }
 
-        numConfirmationsRequired = _numConfirmationsRequired;
+        numApprovalsRequired = _numApprovalsRequired;
     }
 
 
@@ -98,11 +140,13 @@ contract Multisig {
     }
 
     /**
-        *@dev gets the detail of a proposal
-        *@param _proposalIndex the index of the proposal of interest
+    *@dev gets the detail of a proposal
+    *@param _proposalIndex the index of the proposal of interest
      */
-    function getProposal(uint256 _proposalIndex) public view returns (Proposal memory) {
-        return proposals[_proposalIndex];
+    function getProposal(uint256 _proposalIndex) public view returns (address targetContract, address from, address to, bytes memory data, uint256 amount, ProposalType _type, ProposalState _state, uint256 _approvals, uint256 _rejections) {
+        Proposal memory proposal = proposals[_proposalIndex];
+
+        return(proposal.targetContract, proposal.from, proposal.to, proposal.data, proposal.amount, proposal.proposalType, proposal.state, proposal.numApprovals, proposal.numRejections);
     }
 
     /**
@@ -129,6 +173,7 @@ contract Multisig {
         uint256 _amount,
         ProposalType _proposalType
     ) private {
+        address sender = msg.sender;
         uint proposalIndex = proposals.length;
         proposals.push(
             Proposal({
@@ -139,12 +184,13 @@ contract Multisig {
                 amount: _amount,
                 proposalType: _proposalType,
                 state: ProposalState.PENDING,
-                numConfirmations: 0,
+                numApprovals: 1,
                 numRejections: 0
             })
         );
+        isApproved[proposalIndex][sender] = true;
 
-        emit ProposalCreated(msg.sender, proposalIndex, _data);
+        emit ProposalCreated(sender, proposalIndex, _data);
     }
 
     /**
@@ -208,6 +254,38 @@ contract Multisig {
             ProposalType.WITHDRAW_TOKENS_OF_TARGET
         );
     }
+
+
+    /**
+     * @dev creates a proposal requesting the withdrawal tokens minted by the contract which have been sent back into it
+     * @param _newSigner the new signer's address
+    */
+    function requestAddNewSigner(address _newSigner) external onlySigner {
+        _submitProposal(
+            address(this),
+            address(0),
+            _newSigner,
+            "0x0",
+            0,
+            ProposalType.ADD_NEW_SIGNER
+        );
+    }
+
+
+    /**
+     * @dev creates a proposal requesting the withdrawal tokens minted by the contract which have been sent back into it
+     * @param _numReqApproval the new amount of required approvals
+    */
+    function requestUpdateReqApprovals(uint256 _numReqApproval) external onlySigner {
+        _submitProposal(
+            address(this),
+            address(0),
+            address(0),
+            "0x0",
+            _numReqApproval,
+            ProposalType.UPDATE_REQ_APPROVALS
+        );
+    }
     
 
     /**
@@ -269,7 +347,7 @@ contract Multisig {
     function executeRemoteProposal(uint256 _proposalIndex) public isPending(_proposalIndex) {
         Proposal storage proposal = proposals[_proposalIndex];
         require(
-            proposal.numConfirmations >= numConfirmationsRequired,
+            proposal.numApprovals >= numApprovalsRequired,
            "Needs More Approvals"
         );
         proposal.state = ProposalState.COMPLETED;
@@ -284,7 +362,7 @@ contract Multisig {
     function executeMultisigProposal(uint256 _proposalIndex) public isPending(_proposalIndex) {
         Proposal storage proposal = proposals[_proposalIndex];
         require(
-            proposal.numConfirmations >= numConfirmationsRequired,
+            proposal.numApprovals >= numApprovalsRequired,
            "Insufficient Approvals"
         );
 
@@ -297,6 +375,12 @@ contract Multisig {
         } else if(proposal.proposalType == ProposalType.REPLACE_MULTISIG_SIGNER) {
             proposal.state = ProposalState.COMPLETED;
             _executeReplaceSigner(proposal.from, proposal.to, proposal.amount);
+        } else if(proposal.proposalType == ProposalType.ADD_NEW_SIGNER) {
+            proposal.state = ProposalState.COMPLETED;
+            _executeAddNewSigner(proposal.to);
+        } else if(proposal.proposalType == ProposalType.UPDATE_REQ_APPROVALS) {
+            proposal.state = ProposalState.COMPLETED;
+            _executeUpdateReqApprovals(proposal.amount);
         }
 
         require(proposal.state == ProposalState.COMPLETED, "Incorrect Proposal");
@@ -313,6 +397,7 @@ contract Multisig {
         (bool success, ) = payable(_to).call{value: _amount}("");
         require(success, "Transfer Failed");
     }
+
 
     /**
         * @dev executes tranfer of erc2-/bep20 token
@@ -336,6 +421,29 @@ contract Multisig {
         isSigner[_to] = true;
     }
 
+    /**
+        * @dev adds new siger to the multisig contract
+        * @param _newSigner index of signer in the signers array
+    */
+    function _executeAddNewSigner(address _newSigner) internal {
+        require(_newSigner != address(0), "Invalid Signer Address");
+        require(!isSigner[_newSigner], "Already A Signer");
+        signers.push(_newSigner);
+        isSigner[_newSigner] = true;
+    }
+
+    /**
+        * @dev adds new siger to the multisig contract
+        * @param _num new number of required signers
+    */
+    function _executeUpdateReqApprovals(uint256 _num) internal {
+        require(
+            _num > 0 &&
+                _num <= signers.length,
+            "Too Few Approvals Required"
+        );
+        numApprovalsRequired = _num;
+    }
 
     /**
         * @dev Let's a signer approve a specific proposal
@@ -343,10 +451,10 @@ contract Multisig {
     */
     function approveProposal(uint256 _proposalIndex) public isPending(_proposalIndex) {
         address sender = msg.sender;
-        require(!isConfirmed[_proposalIndex][sender], "Already Confirmed");
+        require(!isApproved[_proposalIndex][sender], "Already Approved");
         Proposal storage proposal = proposals[_proposalIndex];
-        proposal.numConfirmations += 1;
-        isConfirmed[_proposalIndex][sender] = true;
+        proposal.numApprovals += 1;
+        isApproved[_proposalIndex][sender] = true;
         emit ApproveProposal(sender, _proposalIndex);
     }
 
@@ -357,12 +465,12 @@ contract Multisig {
     function rejectProposal(uint256 _proposalIndex) public isPending(_proposalIndex) {
         address sender = msg.sender;
         bool _wasRejected = isRejected[_proposalIndex][sender];
-        require(!isConfirmed[_proposalIndex][sender], "Revoke Approval First");
+        require(!isApproved[_proposalIndex][sender], "Revoke Approval First");
         require(!_wasRejected, "Already Rejected");
         Proposal storage proposal = proposals[_proposalIndex];
         proposal.numRejections += 1;
         isRejected[_proposalIndex][sender] = true;
-        if(proposal.numRejections == numConfirmationsRequired) {
+        if(proposal.numRejections == numApprovalsRequired) {
             proposal.state = ProposalState.REJECTED;
         }
         emit ApproveProposal(sender, _proposalIndex);
@@ -375,10 +483,10 @@ contract Multisig {
     function revokeApproval(uint256 _proposalIndex) public isPending(_proposalIndex) {
         address sender = msg.sender;
         Proposal storage proposal = proposals[_proposalIndex];
-        require(isConfirmed[_proposalIndex][sender], "Proposal Wasn't Approved");
-        proposal.numConfirmations -= 1;
-        isConfirmed[_proposalIndex][sender] = false;
-        emit RevokeConfirmation(sender, _proposalIndex);
+        require(isApproved[_proposalIndex][sender], "Proposal Wasn't Approved");
+        proposal.numApprovals -= 1;
+        isApproved[_proposalIndex][sender] = false;
+        emit RevokeApproval(sender, _proposalIndex);
     }
 
 
